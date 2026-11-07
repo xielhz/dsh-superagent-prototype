@@ -11,6 +11,7 @@ import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
 
+const WIN = process.platform === 'win32'
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
@@ -20,7 +21,8 @@ export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bi
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
-export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
+/** Git for Windows runs `!` helpers through its own sh; a double-quoted path survives the spaces Windows paths hold. */
+export const credentialHelper = (cli: string): string => WIN ? `!"${cli}" auth git-credential` : `!${shellQuote(cli)} auth git-credential`
 
 export function sameDirectory(a: string, b: string): boolean {
   const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
@@ -61,7 +63,8 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
   const head = (await readFile(file, 'utf8')).split('\n', 2)
-  return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
+  // A Windows shim carries the marker after `rem `, so match the line's content rather than the whole line.
+  return [MARKER, ...LEGACY_MARKERS].some(marker => head.some(line => line.includes(marker)))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
   let foreign = false
@@ -86,17 +89,26 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const kept = new Set<string>()
   const shim = async (name: string, body: string): Promise<void> => {
     const temporary = join(dir, `.${name}.${process.pid}.tmp`)
-    await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
-    await rename(temporary, join(dir, name))
-    kept.add(name)
+    // Windows resolves commands through PATHEXT, so its shims are batch files; POSIX shells run the shebang form.
+    const file = WIN ? `${name}.cmd` : name
+    await writeFile(temporary, WIN ? body : `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
+    await rename(temporary, join(dir, file))
+    kept.add(file)
   }
   const withoutShims = [
     `self=${shellQuote(dir)}`, 'rest=', 'IFS=:', 'set -f',
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
-  const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
+  // Each shim drops its own directory from PATH first, so a wrapper that resolves `gh` by name reaches the real binary.
+  const run = (program: string): string => WIN
+    ? ['@echo off', `rem ${MARKER}`, 'setlocal EnableExtensions', 'set "SHIM=%~dp0"', 'set "SHIM=%SHIM:~0,-1%"',
+      'set "PATH=;%PATH%;"', 'set "PATH=%PATH:;%SHIM%;=;%"', 'set "PATH=%PATH:~1,-1%"',
+      `"${program}" %*`, 'exit /b %ERRORLEVEL%'].join('\r\n')
+    : `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  const fail = (message: string): string => WIN
+    ? ['@echo off', `rem ${MARKER}`, `>&2 echo ${message}`, 'exit /b 1'].join('\r\n')
+    : `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', run(github.cli))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
@@ -139,7 +151,10 @@ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 
   const { github, stateDir } = deployment
   // `-z` separates fields with NUL and never quotes paths.
   const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
-  if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
+  const expected = [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')
+  // Git for Windows reports separators as forward slashes; compare the paths in one spelling.
+  const normal = (text: string): string => process.platform === 'win32' ? text.replaceAll('\\', '/').toLowerCase() : text
+  if (normal(helpers.join('\0')) !== normal(expected)) throw new SetupError('gitTooOld')
 }
 
 /**

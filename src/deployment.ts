@@ -10,7 +10,10 @@ import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
-const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
+const WIN = process.platform === 'win32'
+/** Absolute paths: `/…` everywhere, plus `C:\…` or `C:/…` on Windows. */
+const ABSOLUTE = WIN ? /^([A-Za-z]:[\\/]|\/)/ : /^\//
+const absolute = (description: string) => s.string().pattern(ABSOLUTE).description(`${description} Absolute path.`)
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -72,7 +75,11 @@ export type Probe = (argv: string[]) => Promise<string>
 /** Run startup checks through DSH's worker subprocess service with worker shims removed from PATH so a `gh` wrapper script reaches the real binary. */
 export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd: string, signal: AbortSignal): Probe {
   const path = withoutDirectory(process.env.PATH ?? '', workerBin(stateDir))
-  return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  const deadline = (): AbortSignal => AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+  // Windows has no `env` command; probes there run the executable directly and resolve it by absolute path.
+  return WIN
+    ? argv => runAsWorker(subprocess, argv, cwd, deadline())
+    : argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, deadline())
 }
 
 const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.number().int().positive() })
@@ -117,7 +124,9 @@ export async function resolveFeishuBot(machine: Machine, feishu: unknown, probe:
   const fail = (error: unknown): never => { throw error instanceof SetupError ? error : new SetupError('feishuCliFailed', { output: reason(error) }) }
   let cli = ''
   try { cli = executable(name, path, workerBin(machine.stateDir)) } catch (error) { fail(error) }
-  const run = (...args: string[]): Promise<string> => probe(['env', 'LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1', 'LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1', cli, ...args]).catch(fail)
+  const run = (...args: string[]): Promise<string> => (WIN
+    ? probe([cli, ...args])
+    : probe(['env', 'LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1', 'LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1', cli, ...args])).catch(fail)
   const text = await run('auth', 'status')
   const status = parsed(AuthStatus, text.slice(text.indexOf('{')))
   if (!status) return fail(new SetupError('feishuNoApp'))

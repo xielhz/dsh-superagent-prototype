@@ -294,11 +294,21 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${interval}s${dropped}`, at: round.started })
   return interval
 }
+/**
+ * How far before the stored cursor each notification round re-reads.
+ * GitHub indexes a notification a moment after the comment exists, while the cursor advances to the start of the
+ * round that fetched it: without an overlap a comment written just before a round, but indexed just after it, is
+ * never seen - the next round asks for a later `since` and the item is gone for good. The overlap is harmless because
+ * a Trigger's ID is derived from its content, so re-reading the same comment yields the same ID.
+ */
+const LOOKBACK_MS = 180_000
+const lookback = (at: string): string => new Date(Date.parse(at) - LOOKBACK_MS).toISOString()
+
 /** Reads notifications since the cursor and each Issue or PR they name, advancing the cursor atomically with the retry map for failed reads; deleted (410) Issues are dropped once their error is recorded. */
 async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ count: number; interval: number }> {
   const { state } = ctx
   const commands = ctx.commands.withSignal(round.signal)
-  const since = state.get(KV.github.since) ?? round.started
+  const since = lookback(state.get(KV.github.since) ?? round.started)
   if (state.get(KV.github.since) === undefined) state.set(KV.github.since, since)
   const { repository } = ctx.deployment
   const path = `notifications?all=true&per_page=50&since=${encodeURIComponent(since)}`
@@ -320,7 +330,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     const address = githubAddress(notification.subject.url ?? '', repository)
     if (!address || address.discussion || items.has(address.number)) continue
     const { number, pr } = address
-    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
+    items.set(number, { since: lookback([state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!), pr })
   }
   for (const [number, item] of items) {
     if (stopped(ctx, round)) return { count: notifications.length, interval }
