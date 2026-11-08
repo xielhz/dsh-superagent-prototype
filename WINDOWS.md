@@ -376,3 +376,45 @@ So the three shutdown modes are distinct and each behaves as intended:
 | `start` / `restart` | cleared | restarts as usual |
 
 Two small script details this exposed: the marker lives next to the audit log (`$control`), not beside the state directory, and `start` prints nothing on success - read the exit code, or call `status` afterwards.
+
+## Telegram as a Source of its own
+
+The plugin does not use `dsh-connect`; it carries its own Telegram Source so the agent talks to a bot with its own credentials. `src/sources/telegram.ts` defines the kind, `telegram-trigger.ts` normalises Bot API updates into Triggers, and `telegram-channel.ts` posts replies.
+
+```text
+src/sources/telegram.ts          SourceKind + getUpdates long-poll + Cordis entry (dsh-superagent-telegram)
+src/sources/telegram-trigger.ts  Update schema, thread/channel/id derivation, mentions()
+src/sources/telegram-channel.ts  sendMessage, t.me deep links
+tsdown.config.ts                 entry 'telegram-watch' -> lib/telegram-watch.js
+cordis.patch.yml                 - id: dsh-superagent-telegram / name: dsh-superagent/telegram-watch
+```
+
+Behaviour worth knowing:
+
+* **The token never enters settings.** The Source reads it from `tokenFile` (default `C:\Users\Dell\.dsh\secrets\superagent-telegram-token.txt`); the settings JSON only stores that path. Delete the file and the Source drops to `paused` instead of failing.
+* **A private message is `addressed: direct`; a group message must mention `@<botUsername>`** to be `mention`. Both become explicit mandates; everything else is an inferred candidate for the Policy's admission table.
+* **Trigger IDs are content hashes** (`key('telegram-message', chatId, messageId, editDate)`), so re-reading a message is a no-op while an edit counts as a new event.
+* **The first poll drains the backlog** with `getUpdates{offset:-1,limit:1}` so a fresh install does not replay old chat.
+* **Messages are plain text** and pass through `checkedImText` (100-word IM limit), so no parse mode can break; rich cards are a later phase.
+* **Only one process may poll a bot.** A second `getUpdates` consumer (another profile, a test script) gets HTTP 409.
+
+### Verified end to end (2026-11-08)
+
+```text
+11:48:15  /start   -> trigger, decision ignore [not_a_member]      (no allowlist entry yet)
+11:48:20  你好      -> trigger, decision ignore [not_a_member]
+11:51:16  request   -> trigger addressed:direct, decision accept [explicitRouted]
+11:51:40  ticket 439a0980 '冒烟测试：仅回复“收到”，不修改文件' ended [dropped]
+          outbox telegram:5049932739 status=sent text='收到'
+```
+
+`dropped` rather than `completed` is the executor saying there was nothing to change - the request was only to reply. The reply reached the chat through `sendMessage`, and `outbox.status` is `sent`, which the channel only returns when Telegram answers `ok`.
+
+Allowlisting a Telegram user is a Policy write, not a Source write:
+
+```powershell
+PUT /orchestrator/api/settings/policy   {value:{...,sources:{telegram:{allowed:[{id:'5049932739'}]}}},revision:1}
+-> {"saved":true,"revision":2,"policy_changed":true}
+```
+
+Until that entry exists, every message from that account is recorded as `ignore` with reason `not_a_member` - which is exactly what the first two messages above show.

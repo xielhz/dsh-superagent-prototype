@@ -24,6 +24,18 @@ The service is up and healthy, and the whole loop has been exercised end to end 
 4. **Crash recovery works, twice.** Killing the host without the stop marker leaves a stale `superagent.lock`; the scheduled task starts it again anyway, and the script removes the lock first. Measured: kill -> 90 s -> `runtime=ready`, same tickets, same identity.
 5. **Idle is not "waiting for you".** Two tickets sat at stage `idle` for an hour with open PRs because their workers reported `waiting` (not `ready`). A comment on each PR thread woke them; both now read `person/review`. Operational rule: only `person/review` means someone must act.
 
+## Health trail without a monitor
+
+The control script's exit line now carries a health snapshot whenever the management API answered, so `audit.log` doubles as a health trail at the scheduled task's cadence (every ten minutes):
+
+```text
+2026-11-08T02:56:45.1508051 pid=50200 user=Dell action=start ... respectStop=True exit=0 health=runtime:ready,relay:ready,notice:ready,launch:ready,delivery:ready,assessment:ready,reply:ready,evals:ready,models:ready,github:ready
+```
+
+`scripts/superagent-patrol.ps1` is the finer-grained check (it also notices a ticket waiting at `person/review` and a stale lock); the audit line is what proves the schedule itself kept running.
+
+Everything below is committed locally as `36ad6a7` on top of the upstream `8c32a9d` (nothing pushed): source patches, the PowerShell scripts, `WINDOWS.md`, and this report.
+
 ## Two bugs fixed in the source
 
 * **Notification lookback** (`src/sources/github.ts`): the poll cursor advanced to the start of each round while GitHub indexes notifications with a delay, so comments written just before a round were lost forever. Now a 180 s lookback window is re-read on every round; trigger IDs are content hashes, so re-reading is idempotent.
