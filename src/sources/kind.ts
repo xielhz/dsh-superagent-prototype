@@ -4,6 +4,7 @@ import type { z } from 'zod'
 import type { OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import type { Commands } from '../infra/commands.ts'
+import type { Key } from '../kv.ts'
 import type { SourceContext, SourceHost } from './host.ts'
 
 export interface Localized { zh: string; en: string }
@@ -61,12 +62,19 @@ export interface ContextMessage {
 }
 export type ContextPartName = 'thread' | 'root' | 'parent'
 export interface ContextPart { messages: ContextMessage[]; next?: string | undefined; body: Record<string, unknown>; status?: string }
+/** Read access to the Source-scoped KV records of `SourceContext.state`, for a reader that serves what its Source cached while polling. */
+export interface ContextState {
+  get<V>(key: Key<V>): V | undefined
+}
 /** Bounded thread context reader used by assessments to inspect messages and images around a trigger. */
 export interface ThreadContext<C> {
   /** The ID of the Trigger's own message among the messages of its Thread. */
   messageId(trigger: Trigger): string
-  /** Reads a page of thread messages (`thread`, first page when `cursor` is omitted), the topic root (`root`), or the replied-to message (`parent`). */
-  read(commands: Commands, trigger: Trigger, part: ContextPartName, cursor: string | undefined, config: C): Promise<ContextPart>
+  /**
+   * Reads a page of thread messages (`thread`, first page when `cursor` is omitted), the topic root (`root`), or the replied-to message (`parent`).
+   * `state` reads the records the kind cached while polling, for a kind whose source API serves no history.
+   */
+  read(commands: Commands, trigger: Trigger, part: ContextPartName, cursor: string | undefined, config: C, state: ContextState): Promise<ContextPart>
   /** Extracts image keys from message text that `image` can read; omitted for kinds without image support. */
   images?(text: string): string[]
   /** Reads one image of a message in the Trigger's Thread as an attachment for `agent`. */

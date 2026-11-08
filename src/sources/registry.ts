@@ -3,7 +3,7 @@ import type { ChannelRef, OutboundMessage, ScopeResult, SourceScope, Trigger } f
 import type { Commands } from '../infra/commands.ts'
 import { HealthBoard, type HealthEntry } from '../infra/health.ts'
 import { AdmissionTableSchema, type Settings } from '../policy.ts'
-import type { ChannelLink, ChannelLinks, SourceInstance, SourceKind, TriggerContext, VariableSpec } from './kind.ts'
+import type { ChannelLink, ChannelLinks, ContextState, SourceInstance, SourceKind, TriggerContext, VariableSpec } from './kind.ts'
 
 
 /**
@@ -14,7 +14,9 @@ export class SourceRegistry implements SourceScope {
   private readonly kinds = new Map<string, SourceKind>()
   private readonly health = new Map<string, HealthEntry>()
   constructor(private readonly settings: () => Settings, private readonly board: Pick<HealthBoard, 'claim'> = new HealthBoard(),
-    private readonly registered: (kind: SourceKind) => () => void = () => () => {}) {}
+    private readonly registered: (kind: SourceKind) => () => void = () => () => {},
+    /** Reads the records a kind cached while polling; a registry built without it serves empty thread context to such kinds. */
+    private readonly state: ContextState = { get: () => undefined }) {}
 
   /** Registers a SourceKind, claims its health entries on HealthBoard (rejecting `sync:` prefixes owned by Settings), and returns an unregister disposer. */
   register<C extends Record<string, unknown>>(kind: SourceKind<C>): () => void {
@@ -113,7 +115,7 @@ export class SourceRegistry implements SourceScope {
     const { config } = this.resolve(kind, settings.sources[kind.kind])
     return {
       messageId: context.messageId(trigger),
-      read: (commands, part, cursor) => context.read(commands, trigger, part, cursor, config),
+      read: (commands, part, cursor) => context.read(commands, trigger, part, cursor, config, this.state),
       images: text => context.images?.(text) ?? [],
       image: async (agent, commands, message, key, stateDir, signal) => {
         if (!context.image) throw new Error(`The ${kind.kind} Source has no images`)

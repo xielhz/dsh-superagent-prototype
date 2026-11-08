@@ -6,12 +6,14 @@ import { record } from '../kv.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import type { SourceKind } from './kind.ts'
 import { pause } from './poll.ts'
-import { sendTelegram, setTelegramToken, telegramLink } from './telegram-channel.ts'
-import { SOURCE, TelegramMeSchema, TelegramUpdateSchema, messageTrigger, senderName,
-  type TelegramMessage, type TelegramMe, type TelegramUpdate } from './telegram-trigger.ts'
+import { sendTelegram, setTelegramNotify, setTelegramToken, telegramLink } from './telegram-channel.ts'
+import { contextEntry, remember, TELEGRAM_CONTEXT, telegramThreadContext } from './telegram-context.ts'
+import { SOURCE, TelegramMeSchema, TelegramUpdateSchema, messageTrigger, senderName, telegramThread, telegramThreadOf,
+  type TelegramMessage, type TelegramMe, type TelegramThreading, type TelegramUpdate } from './telegram-trigger.ts'
 
-export { SOURCE, messageTrigger, telegramChannel, telegramThread, telegramTriggerId } from './telegram-trigger.ts'
-export type { TelegramMessage, TelegramMe, TelegramUpdate } from './telegram-trigger.ts'
+export { SOURCE, messageTrigger, telegramChannel, telegramThread, telegramThreadOf, telegramTriggerId } from './telegram-trigger.ts'
+export type { TelegramMessage, TelegramMe, TelegramThreading, TelegramUpdate } from './telegram-trigger.ts'
+export { CONTEXT_MESSAGES, TELEGRAM_CONTEXT, telegramThreadContext } from './telegram-context.ts'
 
 /** `getUpdates` cursor: the next update to read, so a restart resumes instead of replaying the chat's backlog. */
 const OFFSET = record<number>('telegram-offset')
@@ -28,12 +30,27 @@ export const TelegramConfigSchema = z.object({
     .refine(chats => new Set(chats.map(chat => chat.chatId)).size === chats.length, 'Duplicate chat IDs').default([]),
   otherChats: z.enum(['none', 'mentions']).default('none'),
   directMessages: z.boolean().default(true),
+  // How one chat splits into Threads; `chat` keeps every message of a chat on the Thread it always had.
+  threading: z.enum(['chat', 'topic', 'reply', 'message']).default('chat'),
+  // A chat every reply is mirrored to, so a channel can follow the work without being the chat that asked; empty turns it off.
+  notifyChatId: z.string().trim().regex(/^(-?\d+)?$/, 'A chat ID is digits, optionally with a leading minus').default(''),
 }).strict()
 export type TelegramConfig = z.infer<typeof TelegramConfigSchema>
 
 /** Title of a chat's Thread: the sender in a private chat, the chat's own title in a group. */
 export const chatLabel = (message: TelegramMessage): string => message.chat.type === 'private'
   ? senderName(message.from) || String(message.chat.id) : message.chat.title || String(message.chat.id)
+/**
+ * Title of the Thread `threading` puts a message on: the chat's own title, plus the topic, the message a reply answers or the
+ * message itself when the mode separates them, so a chat's Threads are told apart in the panel.
+ */
+export const threadLabel = (message: TelegramMessage, threading: TelegramThreading): string => {
+  const chat = chatLabel(message)
+  if (threading === 'topic' && message.message_thread_id) return chat + ' · topic ' + message.message_thread_id
+  if (threading === 'reply' && message.reply_to_message?.message_id) return chat + ' · reply to #' + message.reply_to_message.message_id
+  if (threading === 'message') return chat + ' · #' + message.message_id
+  return chat
+}
 
 export const telegramKind: SourceKind<TelegramConfig> = {
   kind: SOURCE,
@@ -55,11 +72,22 @@ export const telegramKind: SourceKind<TelegramConfig> = {
     { key: 'otherChats', type: 'select', label: { zh: '其他群', en: 'Other chats' }, options: [{ value: 'none', label: { zh: '不接收', en: 'Not received' } }, { value: 'mentions', label: { zh: '仅 @', en: '@ only' } }],
       hint: { zh: '机器人已加入、但没列在上面的群。“仅 @”接收那里 @ 机器人的消息；谁的消息能发起工作看策略里的准入。', en: 'Chats the bot has joined that are not listed above. "@ only" receives messages there that mention the bot; whose messages may originate work is the Policy\'s admission.' } },
     { key: 'directMessages', type: 'switch', label: { zh: '接收私聊', en: 'Direct messages' } },
+    { key: 'threading', type: 'select', label: { zh: '对话分线方式', en: 'Threading' },
+      options: [
+        { value: 'chat', label: { zh: '整个群一条线程', en: 'One Thread per chat' } },
+        { value: 'topic', label: { zh: '每个话题一条线程', en: 'One Thread per topic' } },
+        { value: 'reply', label: { zh: '每条回复链一条线程', en: 'One Thread per reply chain' } },
+        { value: 'message', label: { zh: '每条消息一条线程', en: 'One Thread per message' } },
+      ],
+      hint: { zh: '一条线程可以有自己的工单。“每个话题”把论坛群的每个话题分开，一个话题一条对话、一张工单，天然并行；“每条回复链”把回复并到它答复的那条消息上；“每条消息”最接近飞书，每条新消息自成一条线程。', en: 'A Thread can have its own Ticket. "One per topic" separates the topics of a forum group, so each topic is one conversation and one Ticket that run in parallel; "One per reply chain" joins a reply to the message it answers; "One per message" comes closest to Feishu, where every new message starts its own Thread.' } },
     { key: 'pollSeconds', type: 'number', advanced: true, min: 5, max: 60, label: { zh: '长轮询秒数', en: 'Long-poll seconds' },
       hint: { zh: 'getUpdates 的长轮询超时；这一轮结束后才开始下一轮。', en: 'getUpdates long-poll timeout; the next round starts after it returns.' } },
     { key: 'failuresBeforeError', type: 'number', advanced: true, min: 1, max: 20, label: { zh: '连续失败几次后报告异常', en: 'Failed polls before reporting an error' } },
+    { key: 'notifyChatId', type: 'text', advanced: true, pattern: '-?\\d+', label: { zh: '通知频道 chat id', en: 'Notification chat ID' },
+      hint: { zh: '填一个频道或群的 chat id：每条回复除了发给原对话，也把同样的文字镜像到这里，方便频道里的其他人看进展。镜像失败不影响原回复；留空表示不镜像。用负数表示频道或超级群（例如 -1001234567890）。', en: 'A channel or group chat ID: every reply is also mirrored there, word for word, so the people following a channel see the progress. A failed mirror leaves the reply that was sent alone; empty turns mirroring off. Channels and supergroups take a negative ID (such as -1001234567890).' } },
   ],
   health: ['telegram'],
+  threadContext: telegramThreadContext,
   scope({ meta }, config) {
     if (meta.direct === true) return config.directMessages ? { listened: true, observed: false, row: 'direct' } : { listened: false, reason: 'direct_messages_not_allowed' }
     const chatId = String(meta.chatId ?? '')
@@ -127,6 +155,27 @@ async function api<T>(token: string, method: string, body: Record<string, unknow
 export const pollFailure = (failures: number, threshold: number, error: unknown) =>
   failures >= threshold ? health('error', 'pollFailures', { count: String(failures), error: String(error) }) : undefined
 
+/**
+ * Takes in one Bot API update. A message becomes a Trigger on its Thread; a channel post names the channel and records its
+ * Thread without becoming work, because nobody asked the bot anything there. Both are kept in the chat's context window,
+ * which is all an assessment can be given: `getUpdates` serves no history.
+ */
+export async function ingestUpdate(ctx: SourceContext, update: TelegramUpdate, config: TelegramConfig, username: string): Promise<void> {
+  const message = update.message ?? update.edited_message ?? update.channel_post ?? update.edited_channel_post
+  if (!message) return
+  const chatId = String(message.chat.id)
+  const post = !update.message && !update.edited_message
+  const trigger = post ? undefined : messageTrigger(message, { username }, config.threading)
+  const thread = trigger?.channel?.thread ?? telegramThread(chatId)
+  // Every message the Source read joins the window, including ones not listened to: a later mention reads what led to it.
+  const key = TELEGRAM_CONTEXT(chatId)
+  ctx.state.set(key, remember(ctx.state.get(key), contextEntry(message, thread)))
+  if (!trigger) { ctx.threads.describe(thread, { label: chatLabel(message) }); return }
+  if (!telegramKind.scope!({ meta: trigger.meta }, config).listened) return
+  ctx.threads.describe(thread, { label: threadLabel(message, config.threading) })
+  await ctx.receive(trigger)
+}
+
 async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   await ctx.ready
   let failures = 0
@@ -148,18 +197,14 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
         offset = latest.length ? latest[0]!.update_id + 1 : 1
         ctx.state.set(OFFSET, offset)
       }
+      setTelegramNotify(config.notifyChatId || undefined)
       const updates = await api<TelegramUpdate[]>(token, 'getUpdates',
-        { offset, timeout: config.pollSeconds, allowed_updates: ['message', 'edited_message'] }, signal)
+        { offset, timeout: config.pollSeconds, allowed_updates: ['message', 'edited_message', 'channel_post', 'edited_channel_post'] }, signal)
       for (const update of updates) {
         if (signal.aborted) return
         // The cursor advances whether or not the message is admitted: it was read, and re-reading it would only loop.
         ctx.state.set(OFFSET, update.update_id + 1)
-        const message = update.message ?? update.edited_message
-        if (!message) continue
-        const trigger = messageTrigger(message, { username })
-        if (!telegramKind.scope!({ meta: trigger.meta }, config).listened) continue
-        ctx.threads.describe(trigger.channel!.thread, { label: chatLabel(message) })
-        await ctx.receive(trigger)
+        await ingestUpdate(ctx, update, config, username)
       }
     } catch (error) {
       failures += 1

@@ -384,7 +384,8 @@ The plugin does not use `dsh-connect`; it carries its own Telegram Source so the
 ```text
 src/sources/telegram.ts          SourceKind + getUpdates long-poll + Cordis entry (dsh-superagent-telegram)
 src/sources/telegram-trigger.ts  Update schema, thread/channel/id derivation, mentions()
-src/sources/telegram-channel.ts  sendMessage, t.me deep links
+src/sources/telegram-context.ts  the cached chat window, and telegramThreadContext for assessments
+src/sources/telegram-channel.ts  sendMessage, the notification mirror, t.me deep links
 tsdown.config.ts                 entry 'telegram-watch' -> lib/telegram-watch.js
 cordis.patch.yml                 - id: dsh-superagent-telegram / name: dsh-superagent/telegram-watch
 ```
@@ -393,6 +394,10 @@ Behaviour worth knowing:
 
 * **The token never enters settings.** The Source reads it from `tokenFile` (default `C:\Users\Dell\.dsh\secrets\superagent-telegram-token.txt`); the settings JSON only stores that path. Delete the file and the Source drops to `paused` instead of failing.
 * **A private message is `addressed: direct`; a group message must mention `@<botUsername>`** to be `mention`. Both become explicit mandates; everything else is an inferred candidate for the Policy's admission table.
+* **`threading` decides how one chat splits into Threads, and a Thread can hold its own Ticket.** `chat` (the default) keeps the whole chat on `telegram:<chatId>`; `topic` gives each forum topic its own Thread `telegram:<chatId>:t:<message_thread_id>`, so one topic is one conversation and one Ticket and topics run in parallel; `reply` joins a reply chain on `telegram:<chatId>:r:<replied-to message>`; `message` starts a Thread per message, `telegram:<chatId>:m:<messageId>`, the closest to Feishu. Plain messages in a chat that the mode does not separate stay on `telegram:<chatId>`. The Thread's label in the panel names its topic, reply or message.
+* **`notifyChatId` mirrors every reply into a channel or group** (negative IDs such as `-1001234567890` for channels and supergroups), so people following a channel see the progress without that channel being the one that asked. The mirror is the same text, never a reply, and only when it targets another chat; a failed mirror leaves the reply that was sent alone, and an empty setting turns it off.
+* **Channel posts are read but never worked on.** `channel_post` and `edited_channel_post` are in `allowed_updates`; they record `telegram:<channelId>` as a Thread and keep the post in its chat's window, so the notification channel can be found in the panel, but they become no Trigger.
+* **Assessments read the messages the Source cached.** The Bot API serves no history, so each poll round appends what it reads to `telegram-context:<chatId>` (the last 20 messages of that chat, sender and time included) and `telegramThreadContext` serves a Thread out of that window. A Thread that holds a single message (every message of `message` mode, or a reply nobody answered) reads the chat it was said in instead, so an assessment still sees what came before.
 * **Trigger IDs are content hashes** (`key('telegram-message', chatId, messageId, editDate)`), so re-reading a message is a no-op while an edit counts as a new event.
 * **The first poll drains the backlog** with `getUpdates{offset:-1,limit:1}` so a fresh install does not replay old chat.
 * **Messages are plain text** and pass through `checkedImText` (100-word IM limit), so no parse mode can break; rich cards are a later phase.
